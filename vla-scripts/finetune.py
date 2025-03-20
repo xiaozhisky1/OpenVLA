@@ -116,11 +116,11 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
-    distributed_state = PartialState()
+    distributed_state = PartialState() # 初始化 分布式训练的状态 PartialState()
     torch.cuda.set_device(device_id := distributed_state.local_process_index)
     torch.cuda.empty_cache()
 
-    # Configure Unique Experiment ID & Log Directory
+    # Configure Unique Experiment ID & Log Directory 生成实验 ID 及日志目录
     exp_id = (
         f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
@@ -139,7 +139,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
 
-    # Quantization Config =>> only if LoRA fine-tuning
+    # Quantization Config =>> only if LoRA fine-tuning 配置量化（暂不使用）
     quantization_config = None
     if cfg.use_quantization:
         assert cfg.use_lora, "Quantized training only supported for LoRA fine-tuning!"
@@ -147,23 +147,23 @@ def finetune(cfg: FinetuneConfig) -> None:
             load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
         )
 
-    # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
+    # 将 OpenVLA 注册为 Hugging Face 的 AutoModel，方便后续调用 from_pretrained() 直接加载。
     AutoConfig.register("openvla", OpenVLAConfig)
     AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    # Load OpenVLA Processor and Model using HF AutoClasses
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    # 加载 OpenVLA 处理器 & 模型
+    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True) # processor：用于处理 文本 & 图像输入
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         quantization_config=quantization_config,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-    )
+    ) # vla：加载 OpenVLA 模型，设置 torch_dtype=torch.bfloat16 以减少显存占用
 
-    # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
+    # 设备分配 & LoRA 微调 Device Placement =>> note that BitsAndBytes automatically handles for quantized training
     if cfg.use_quantization:
         vla = prepare_model_for_kbit_training(vla)
     else:
@@ -181,14 +181,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
-    # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
+    # 使用 torch.nn.parallel.DistributedDataParallel (DDP) 进行 多 GPU 训练  Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
     # Create Optimizer =>> note that we default to a simple constant learning rate!
-    trainable_params = [param for param in vla.parameters() if param.requires_grad]
+    trainable_params = [param for param in vla.parameters() if param.requires_grad] # 仅优化 需要更新的参数（冻结其他层
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
-    # Create Action Tokenizer
+    # ---------Create Action Tokenizer---------
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
@@ -206,6 +206,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
     # )
     # ---
+    # 加载数据集 使用 RLDS 格式（强化学习数据）
     batch_transform = RLDSBatchTransform(
         action_tokenizer,
         processor.tokenizer,
@@ -218,14 +219,16 @@ def finetune(cfg: FinetuneConfig) -> None:
         batch_transform,
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
+        image_aug=cfg.image_aug, # 使用数据增强
     )
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
+    # 用于保存数据集的统计信息，这些信息在推理（inference）时用于反归一化动作（de-normalize actions）
     if distributed_state.is_main_process:
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
 
-    # Create Collator and DataLoader
+    # Create Collator and DataLoader 创建数据整理器, 确保训练过程中数据格式的一致性
+    # 由于动作序列的长度不同，我们需要填充（Padding）或截断，以保证所有输入的 input_ids 具有相同长度，方便 批量处理（batch processing）
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
     )
@@ -255,7 +258,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
                     attention_mask=batch["attention_mask"].to(device_id),
-                    pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                    pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id), # 自动混合精度训练
                     labels=batch["labels"],
                 )
                 loss = output.loss
@@ -263,18 +266,20 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Normalize loss to account for gradient accumulation
             normalized_loss = loss / cfg.grad_accumulation_steps
 
-            # Backward pass
+            # Backward pass 反向传播
             normalized_loss.backward()
 
             # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
-            action_preds = action_logits.argmax(dim=2)
-            action_gt = batch["labels"][:, 1:].to(action_preds.device)
-            mask = action_gt > action_tokenizer.action_token_begin_idx
+            action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1] # 提取动作的 logits（未归一化的预测分数）【输出部分不包含文本token】
+            action_preds = action_logits.argmax(dim=2) # 在 logits 的 类别维度 上取最大值，得到 Token ID，最终 action_preds 是模型预测的动作 Token 序列
+            action_gt = batch["labels"][:, 1:].to(action_preds.device) # batch["labels"]：训练时，labels 是真实的 Token ID 序列，包括 文本 Token 和动作 Token
+            # [:, 1:]：移除第一个 Token，因为 labels 通常是 右移一位的目标序列（teacher forcing 机制）
+
+            mask = action_gt > action_tokenizer.action_token_begin_idx # 生成一个 布尔掩码（mask），用于筛选出 仅包含动作 Token 的位置
 
             # Compute Accuracy
-            correct_preds = (action_preds == action_gt) & mask
-            action_accuracy = correct_preds.sum().float() / mask.sum().float()
+            correct_preds = (action_preds == action_gt) & mask # 返回一个布尔矩阵，表示 哪些 Token 预测正确
+            action_accuracy = correct_preds.sum().float() / mask.sum().float() # 返回一个布尔矩阵，表示 哪些 Token 预测正确
 
             # Compute L1 Loss on Predicted (Continuous) Actions
             continuous_actions_pred = torch.tensor(

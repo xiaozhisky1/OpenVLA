@@ -16,7 +16,7 @@ import os
 import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union, Sized
-
+from torch.optim import AdamW
 import torch
 import torch.utils.data
 import transformers
@@ -40,7 +40,6 @@ from transformers import (
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
-from open_r1.utils.action_tokenizer import ActionTokenizer
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
@@ -54,7 +53,7 @@ from torch.utils.data import Sampler
 import warnings
 
 if is_peft_available():
-    from peft import PeftConfig, get_peft_model
+    from peft import PeftConfig, get_peft_model, LoraConfig
 
 if is_wandb_available():
     import wandb
@@ -114,7 +113,7 @@ class RepeatRandomSampler(Sampler):
         return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
-class Qwen2VLGRPOTrainer(Trainer):
+class OpenVLAGRPOTrainer(Trainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://huggingface.co/papers/2402.03300).
@@ -202,6 +201,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         self,
         model: Union[str, PreTrainedModel],
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        data_collator = None,
         args: GRPOConfig = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
@@ -209,12 +209,13 @@ class Qwen2VLGRPOTrainer(Trainer):
         reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
-        peft_config: Optional["PeftConfig"] = None,
+        peft_config: Optional["LoraConfig"] = None,
         freeze_vision_modules: Optional[bool] = False,
         max_pixels: Optional[int] = 12845056,
         min_pixels: Optional[int] = 3136,
         attn_implementation: str = "flash_attention_2",
         torch_dtype: str = "bfloat16",
+
     ):
         # Args
         if args is None:
@@ -252,6 +253,23 @@ class Qwen2VLGRPOTrainer(Trainer):
             elif "Aria" in model_id:
                 model_init_kwargs.pop("use_cache")
                 model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+            elif "openvla" in model_id:
+                from transformers import AutoConfig, AutoImageProcessor
+                from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+                from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+                from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+                from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+                # 将 OpenVLA 注册为 Hugging Face 的 AutoModel，方便后续调用 from_pretrained() 直接加载。
+                AutoConfig.register("openvla", OpenVLAConfig)
+                AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+                AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+                AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+                model = AutoModelForVision2Seq.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                )
             else:
                 model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
         else:
@@ -264,22 +282,27 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         self.vision_modules_keywords = ["visual"]
         if peft_config is not None:
-            def find_all_linear_names(model, multimodal_keywords):
-                cls = torch.nn.Linear
-                lora_module_names = set()
-                for name, module in model.named_modules():
-                    # LoRA is not applied to the vision modules
-                    if any(mm_keyword in name for mm_keyword in multimodal_keywords):
-                        continue
-                    if isinstance(module, cls):
-                        lora_module_names.add(name)
-                for m in lora_module_names:  # needed for 16-bit
-                    if "embed_tokens" in m:
-                        lora_module_names.remove(m)
-                return list(lora_module_names)
-            target_modules = find_all_linear_names(model, self.vision_modules_keywords)
-            peft_config.target_modules = target_modules
+            # def find_all_linear_names(model, multimodal_keywords):
+            #     cls = torch.nn.Linear
+            #     lora_module_names = set()
+            #     for name, module in model.named_modules():
+            #         # LoRA is not applied to the vision modules
+            #         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
+            #             continue
+            #         if isinstance(module, cls):
+            #             lora_module_names.add(name)
+            #     for m in lora_module_names:  # needed for 16-bit
+            #         if "embed_tokens" in m:
+            #             lora_module_names.remove(m)
+            #     return list(lora_module_names)
+            # target_modules = find_all_linear_names(model, self.vision_modules_keywords)
+            # peft_config.target_modules = target_modules
             model = get_peft_model(model, peft_config)
+            model.print_trainable_parameters()
+            # Create Optimizer =>> note that we default to a simple constant learning rate!
+            trainable_params = [param for param in model.parameters() if param.requires_grad]  # 仅优化 需要更新的参数（冻结其他层
+            optimizer = AdamW(trainable_params, lr=5e-4)
+            optimizers = (optimizer, None)
 
         if freeze_vision_modules:
             print("Freezing vision modules...")
@@ -310,18 +333,18 @@ class Qwen2VLGRPOTrainer(Trainer):
             self.ref_model = None
 
         # Processing class
-        if processing_class is None:
-            if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Aria" in model_id:
-                processing_class = AutoProcessor.from_pretrained(model_id)
-                pad_token_id = processing_class.tokenizer.pad_token_id
-                processing_class.pad_token_id = pad_token_id
-                processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
-                if "Qwen" in model_id or "Qwen2.5-VL" in model_id:
-                    processing_class.image_processor.max_pixels = max_pixels
-                    processing_class.image_processor.min_pixels = min_pixels
-            else:
-                processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
-                pad_token_id = processing_class.pad_token_id
+        # if processing_class is None:
+        #     if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Aria" in model_id:
+        #         processing_class = AutoProcessor.from_pretrained(model_id)
+        #         pad_token_id = processing_class.tokenizer.pad_token_id
+        #         processing_class.pad_token_id = pad_token_id
+        #         processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
+        #         if "Qwen" in model_id or "Qwen2.5-VL" in model_id:
+        #             processing_class.image_processor.max_pixels = max_pixels
+        #             processing_class.image_processor.min_pixels = min_pixels
+        #     else:
+        #         processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+        #         pad_token_id = processing_class.pad_token_id
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -355,8 +378,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.reward_processing_classes = reward_processing_classes
 
         # Data collator
-        def data_collator(features):  # No data collation is needed in GRPO
-            return features
+        # def data_collator(features):  # No data collation is needed in GRPO
+        #     return features
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
@@ -370,7 +393,6 @@ class Qwen2VLGRPOTrainer(Trainer):
             max_new_tokens=self.max_completion_length,
             do_sample=True,  
             temperature=1,
-            pad_token_id=pad_token_id,
         )
         self.beta = args.beta
         self.epsilon = args.epsilon
@@ -493,105 +515,43 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Simple pass-through, just like original
         return inputs
 
-    def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]], model) -> dict[str, Union[torch.Tensor, Any]]:
+    def _generate_and_score_completions(self, inputs: list[dict[str, Union[torch.Tensor, Any]]], model) -> dict[
+        str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs] # 取出所有 prompt
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs] # 应用 chat_template 进行格式化（如果是对话数据）
-        # Handle both pre-loaded images and image paths 处理图像输入
-        images = []
-        for x in inputs:
-            if "image" in x:
-                img = x["image"]
-            elif "image_path" in x and x["image_path"] is not None:
-                img = PIL.Image.open(x["image_path"])
 
-            try:
-                # Ensure minimum dimensions of 28 pixels # 确保图像最小尺寸为 28x28
-                w, h = img.size
-                if w < 28 or h < 28:
-                    # Calculate new dimensions maintaining aspect ratio
-                    if w < h:
-                        new_w = 28
-                        new_h = int(h * (28/w))
-                    else:
-                        new_h = 28
-                        new_w = int(w * (28/h))
-                    img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
-            
-                images.append(img)
-            except:
-                pass
-        # ----对数据进行tokenizer----（只处理了image 和 prompts）
-        if len(images) > 0:
-            prompt_inputs = self.processing_class(
-                text=prompts_text,
-                images=images,
-                return_tensors="pt",
-                padding=True,
-                padding_side="left",
-                add_special_tokens=False,
-            )
-        else:
-            prompt_inputs = self.processing_class(
-                text=prompts_text,
-                return_tensors="pt",
-                padding=True,
-                padding_side="left",
-                add_special_tokens=False,
-            )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        # 提取 batch 数据
+        input_ids = torch.stack([x["input_ids"] for x in inputs]).to(device)
+        labels = torch.stack([x["labels"] for x in inputs]).to(device)
+        attention_mask = (input_ids != self.base_tokenizer.pad_token_id).int().to(device)  # 生成 attention_mask
+        pixel_values = torch.stack([x["pixel_values"] for x in inputs]).to(device) if "pixel_values" in inputs[
+            0] else None
 
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"] # 获取文本部分的信息
-        # if len(images) > 0:
-        #     pixel_values = prompt_inputs["pixel_values"]
-        #     image_grid_thw = prompt_inputs["image_grid_thw"]
-        # else:
-        #     pixel_values = None
-        #     image_grid_thw = None
+        # 构造模型输入
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "labels": labels  # 仅用于 loss 计算
+        }
 
-        
-        # if self.max_prompt_length is not None:
-        #     prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-        #     prompt_inputs["input_ids"] = prompt_ids
-        #     prompt_mask = prompt_mask[:, -self.max_prompt_length :]
-        #     prompt_inputs["attention_mask"] = prompt_mask
-
-        # ----Generate completions 使用 model.generate(...) 生成补全文本（Completion）----
+        # ---- 生成补全文本 ----
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             prompt_completion_ids = unwrapped_model.generate(
-                **prompt_inputs, 
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 generation_config=self.generation_config
             )
 
-            prompt_length = prompt_ids.size(1) # 获取 prompt 的长度
-            prompt_ids = prompt_completion_ids[:, :prompt_length] # 取出补全部分（不包含 Prompt）
-            completion_ids = prompt_completion_ids[:, prompt_length:] # 取出 prompt 以便后续计算 Mask
-            # No need to repeat prompt_mask as we're not duplicating prompts during generation
+            # 获取 Prompt 部分长度
+            prompt_length = input_ids.size(1)
+            completion_ids = prompt_completion_ids[:, prompt_length:]  # 取出生成的补全部分
+            completion_mask = (completion_ids != self.base_tokenizer.pad_token_id).int()  # 计算 Mask
 
-        # Mask everything after the first EOS token 计算 Completion Mask
-        # 找到第一个 <EOS> 位置（eos_token_id）
-        is_eos = completion_ids == self.processing_class.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int() # 创建 completion_mask:标记所有 <EOS> 之前的 token 作为有效 token，之后的部分填充 0
-
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-        try: # 尝试获取图像信息
-            pixel_values = prompt_inputs["pixel_values"]
-            image_grid_thw = prompt_inputs["image_grid_thw"]
-        except:
-            
-            pixel_values = None
-            image_grid_thw = None
+        # ---- 计算 PPO 训练所需的 log-probabilities ----
         with torch.no_grad():
-            # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
-            # computation here, and use per_token_logps.detach() instead.
-            # 计算 Log-Probabilities, 用于PPO
-            if self.num_iterations > 1: # 如果 num_iterations > 1，则计算 old_per_token_logps 以比较新旧策略
+            if self.num_iterations > 1:
                 old_per_token_logps = self._get_per_token_logps(
-                    model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
+                    model, prompt_completion_ids, torch.cat([attention_mask, completion_mask], dim=1), pixel_values
                 )
                 old_per_token_logps = old_per_token_logps[:, prompt_length - 1:]
             else:
@@ -599,112 +559,74 @@ class Qwen2VLGRPOTrainer(Trainer):
 
             if self.beta == 0.0:
                 ref_per_token_logps = None
-            elif self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
-                )
             else:
-                with self.accelerator.unwrap_model(model).disable_adapter():
+                ref_model = self.ref_model if self.ref_model else model
+                with self.accelerator.unwrap_model(ref_model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(
-                        model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
+                        ref_model, prompt_completion_ids, torch.cat([attention_mask, completion_mask], dim=1),
+                        pixel_values
                     )
-        ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
+                    ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
 
-        # Decode the generated completions 解码 completions
-        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
-            completions = [[{"role": "assistant", "content": completion}] for completion in completions]
-
-        # Compute the rewards
-        # No need to duplicate prompts as we're not generating multiple completions per prompt
-        # 计算奖励（Rewards）：计算 reward_func 对 completions 的评分
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        # 解码生成的补全文本
+        completions = self.base_tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        print("decode_completions:")
+        print(completions)
+        # ---- 计算奖励（Reward） ----
+        rewards_per_func = torch.zeros(len(input_ids), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
+                zip(self.reward_funcs, self.reward_processing_classes)):
             if isinstance(reward_func, PreTrainedModel):
-                if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
-                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                else:
-                    texts = [p + c for p, c in zip(prompts, completions)]
-                reward_inputs = reward_processing_class(
-                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                )
+                texts = [self.base_tokenizer.decode(input_id, skip_special_tokens=True) + completion for
+                         input_id, completion in zip(input_ids, completions)]
+                reward_inputs = reward_processing_class(texts, return_tensors="pt", padding=True, padding_side="right",
+                                                        add_special_tokens=False)
                 reward_inputs = super()._prepare_inputs(reward_inputs)
                 with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
-            else: # 执行这一部分代码（inputs对应Datasets的输出）
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
-                # reward_kwargs = {
-                #     "image": [],
-                #     "problem": [],
-                #     "solution": []
-                # }
-                for key in reward_kwargs:
-                    for example in inputs:
-                        # No need to duplicate prompts as we're not generating multiple completions per prompt
-                        # reward_kwargs[key].extend([example[key]] * self.num_generations)
-                        reward_kwargs[key].extend([example[key]])
-                # 最终将reward_kwargs处理为如下形式：
-                # reward_kwargs = {
-                #     "image": [img1, img2],
-                #     "problem": ["What is 2+2?", "Translate 'Hello' to French."],
-                #     "solution": ["4", "Bonjour"]
-                # }
-                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+            else:
+                # input_ids和labels可能需要解码
+                reward_kwargs = {key: [x[key] for x in inputs] for key in inputs[0].keys() if
+                                 key not in ["input_ids", "attention_mask", "labels"]}
+                output_reward_func = reward_func(prompts=input_ids, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-        # Gather rewards across processes
         rewards_per_func = self.accelerator.gather(rewards_per_func)
-        
-        # Sum the rewards from all reward functions
         rewards = rewards_per_func.sum(dim=1)
-        
-        # Compute grouped-wise rewards
-        # Each group consists of num_generations completions for the same prompt
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # 计算优势（Advantage）用于 PPO
-        
-        # Get only the local slice of advantages
-        process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
-        )
+
+        # ---- 计算 Advantage 供 PPO 训练 ----
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1).repeat_interleave(
+            self.num_generations)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1).repeat_interleave(self.num_generations)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+        # 获取当前进程的 rewards 切片
+        process_slice = slice(self.accelerator.process_index * len(inputs),
+                              (self.accelerator.process_index + 1) * len(inputs))
         advantages = advantages[process_slice]
 
-        # Log the metrics
+        # ---- 记录日志信息 ----
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
         reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, PreTrainedModel):
-                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-            else:
-                reward_func_name = reward_func.__name__
+            reward_func_name = reward_func.config._name_or_path.split("/")[-1] if isinstance(reward_func,
+                                                                                             PreTrainedModel) else reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
-
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
 
         return {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
+            "prompt_ids": input_ids,
+            "prompt_mask": attention_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
-            "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw
+            "pixel_values": pixel_values
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

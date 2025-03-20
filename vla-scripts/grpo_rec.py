@@ -26,61 +26,19 @@ import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
-
+import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import Qwen2VLForConditionalGeneration
 
-from math_verify import parse, verify
-from open_r1.trainer import Qwen2VLGRPOTrainer, GRPOConfig
+from grpo_trainer import OpenVLAGRPOTrainer
+from grpo_config import GRPOConfig
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from transformers import TrainingArguments, AutoProcessor
 import yaml
 import json
 import random
 import math
-
-# ----------------------- Fix the flash attention bug in the current version of transformers -----------------------
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionFlashAttention2, apply_rotary_pos_emb_flashatt, flash_attn_varlen_func
-import torch
-from typing import Tuple
-def custom_forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
-        # print(111, 222, 333, 444, 555, 666, 777, 888, 999)
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `rotary_pos_emb` (2D tensor of RoPE theta values), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.54 `rotary_pos_emb` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-            cos = emb.cos().float()
-            sin = emb.sin().float()
-        else:
-            cos, sin = position_embeddings
-            # Add this
-            cos = cos.to(torch.float)
-            sin = sin.to(torch.float)
-        q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
-        q = q.squeeze(0)
-        k = k.squeeze(0)
-
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-            seq_length, -1
-        )
-        attn_output = self.proj(attn_output)
-        return attn_output
-
-Qwen2_5_VLVisionFlashAttention2.forward = custom_forward
 
 
 # ----------------------- Main Script -----------------------
@@ -123,146 +81,34 @@ SYSTEM_PROMPT = (
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
 
-class LazySupervisedDataset(Dataset):
-    def __init__(self, data_path: str, script_args: GRPOScriptArguments):
-        super(LazySupervisedDataset, self).__init__()
-        self.script_args = script_args
-        self.list_data_dict = []
-
-        if data_path.endswith(".yaml"):
-            with open(data_path, "r") as file:
-                yaml_data = yaml.safe_load(file)
-                datasets = yaml_data.get("datasets")
-                # file should be in the format of:
-                # datasets:
-                #   - json_path: xxxx1.json
-                #     sampling_strategy: first:1000
-                #   - json_path: xxxx2.json
-                #     sampling_strategy: end:3000
-                #   - json_path: xxxx3.json
-                #     sampling_strategy: random:999
-
-                for data in datasets: # 根据路径读取文件
-                    json_path = data.get("json_path")
-                    sampling_strategy = data.get("sampling_strategy", "all")
-                    sampling_number = None
-
-                    if json_path.endswith(".jsonl"):
-                        cur_data_dict = []
-                        with open(json_path, "r") as json_file:
-                            for line in json_file:
-                                cur_data_dict.append(json.loads(line.strip()))
-                    elif json_path.endswith(".json"):
-                        with open(json_path, "r") as json_file:
-                            cur_data_dict = json.load(json_file)
-                    else:
-                        raise ValueError(f"Unsupported file type: {json_path}")
-
-                    if ":" in sampling_strategy:
-                        sampling_strategy, sampling_number = sampling_strategy.split(":")
-                        if "%" in sampling_number:
-                            sampling_number = math.ceil(int(sampling_number.split("%")[0]) * len(cur_data_dict) / 100)
-                        else:
-                            sampling_number = int(sampling_number)
-
-                    # Apply the sampling strategy 采样策略
-                    if sampling_strategy == "first" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[:sampling_number]
-                    elif sampling_strategy == "end" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[-sampling_number:]
-                    elif sampling_strategy == "random" and sampling_number is not None:
-                        random.shuffle(cur_data_dict)
-                        cur_data_dict = cur_data_dict[:sampling_number]
-                    print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
-                    self.list_data_dict.extend(cur_data_dict) # 将处理后的数据添加到 list_data_dict（最终所有数据都会被存储在这个列表里）
-        else:
-            raise ValueError(f"Unsupported file type: {data_path}")
-
-    def __len__(self):
-        return len(self.list_data_dict)
-
-    def __getitem__(self, i): # 获取第 i 条数据
-        # Format into conversation
-        def make_conversation(example): # 用于文本任务：格式化为对话数据，包含系统提示 (SYSTEM_PROMPT) 和用户问题 (problem)
-            return {
-                "prompt": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": example["problem"]},
-                ],
-            }
-        # FIXME
-        # This is only for Grounding task
-        QUESTION_TEMPLATE = "{Question} First output the thinking process in <think> </think> tags and then output the final answer in <answer> </answer> tags. Output the final answer in JSON format."
-        def make_conversation_image(example):
-            # 用于图像任务：生成的 prompt 包含 image 和 text；问题格式：先输出思考过程 (<think></think>)，再输出最终答案 (<answer></answer>)
-            return {
-                "prompt": [
-                    # {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
-                        ],
-                    },
-                ],
-            }
-
-        example = self.list_data_dict[i]
-        image_root = self.script_args.image_root
-        if 'image' in example: # 处理图像数据
-            image_path = os.path.join(image_root, example['image']) # 根据 image_root 目录获取图像路径
-            # In case the image is not found
-            while not os.path.exists(image_path): # 如果图像路径不存在，则随机选择一张新图片
-                print(f"Warning: Image {image_path} not found, randomly selecting another image")
-                new_index = random.randint(0, len(self.list_data_dict)-1)
-                example = self.list_data_dict[new_index]
-                image_path = os.path.join(image_root, example['image'])
-            image = Image.open(image_path).convert("RGB")
-        else:
-            image = None
-        
-
-        return {
-            'image': image, # image：图像数据（如果有）
-            'problem': example['problem'], # problem：用户输入问题
-            'solution': example['solution'], # solution：标准答案
-            'prompt': make_conversation_image(example)['prompt'] if 'image' in example else make_conversation(example)['prompt'],
-        } # prompt：格式化后的对话输入（根据是否包含图像选择 make_conversation 或 make_conversation_image）
-
 '''
     If the iou of the bbox predicted by the model and the ground truth is greater than 0.5, the reward is 1.0, otherwise 0.0 .
     This is a hard reward, maybe the soft reward is better and could be used in the future .
 '''
-def iou_reward(completions, solution, **kwargs):
-    def iou(box1, box2):
-        inter_x1 = max(box1[0], box2[0])
-        inter_y1 = max(box1[1], box2[1])
-        inter_x2 = min(box1[2]-1, box2[2]-1)
-        inter_y2 = min(box1[3]-1, box2[3]-1)
-        if inter_x1 < inter_x2 and inter_y1 < inter_y2:
-            inter = (inter_x2-inter_x1+1)*(inter_y2-inter_y1+1)
-        else:
-            inter = 0
-        union = (box1[2]-box1[0])*(box1[3]-box1[1]) + (box2[2]-box2[0])*(box2[3]-box2[1]) - inter
-        return float(inter)/union
-    contents = [completion[0]["content"] for completion in completions]
+def iou_reward(completions, action, **kwargs):
+    def dis(action1, action2):
+        action1 = np.array(action1)
+        action2 = np.array(action2)
+        euclidean_distance = np.linalg.norm(action1 - action2)
+        return float(euclidean_distance)
+    contents = [completion[0]["value"] for completion in completions]
     rewards = []
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
     answer_tag_pattern = r'<answer>(.*?)</answer>'
     # bbox_pattern = r'\[(\s*-?\d*\.?\d+\s*),\s*(\s*-?\d*\.?\d+\s*),\s*(\s*-?\d*\.?\d+\s*),\s*(\s*-?\d*\.?\d+\s*)\]'
-    bbox_pattern = r'\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)]'
-    for content, sol in zip(contents, solution):
+    action_pattern =r'\[(?:[01]?\d{1,2}|2[0-4][0-9]|255)(?:,(?:[01]?\d{1,2}|2[0-4][0-9]|255)){6}\]'
+    for content, act in zip(contents, action):
         reward = 0.0
         # Try symbolic verification first
         try:
             content_answer_match = re.search(answer_tag_pattern, content, re.DOTALL)
             if content_answer_match:
                 content_answer = content_answer_match.group(1).strip()
-                bbox_match = re.search(bbox_pattern, content_answer)
-                if bbox_match:
-                    bbox = [int(bbox_match.group(1)), int(bbox_match.group(2)), int(bbox_match.group(3)), int(bbox_match.group(4))]
-                    if iou(bbox, sol) > 0.5:
+                action_match = re.search(action_pattern, content_answer)
+                if action_match:
+                    action_pred = [int(action_match.group(1)), int(action_match.group(2)), int(action_match.group(3)), int(action_match.group(4)), int(action_match.group(5)),  int(action_match.group(6)),  int(action_match.group(7))]
+                    # 阈值有待商榷
+                    if dis(action_pred, action) > 5:
                         reward = 1.0
         except Exception:
             pass  # Continue to next verification method if this fails
@@ -274,7 +120,7 @@ def iou_reward(completions, solution, **kwargs):
             with open(log_path, "a", encoding='utf-8') as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
                 f.write(f"Content: {content}\n")
-                f.write(f"Solution: {sol}\n")
+                f.write(f"Solution: {action_pred}\n")
     return rewards
 
 
@@ -282,7 +128,7 @@ def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
     # pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
     pattern = r"<think>.*?</think>\s*<answer>.*?\{.*\[\d+,\s*\d+,\s*\d+,\s*\d+\].*\}.*?</answer>"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    completion_contents = [completion[0]["value"] for completion in completions]
     matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
@@ -292,36 +138,250 @@ reward_funcs_registry = {
     "format": format_reward,
 }
 
+import os
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
-def main(script_args, training_args, model_args):
+import draccus
+import torch
+import torch.distributed as dist
+import tqdm
+from accelerate import PartialState
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoConfig, AutoImageProcessor
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+import wandb
+from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
+from prismatic.util.data_utils import PaddedCollatorForActionPrediction
+from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+# Sane Defaults
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+# # === Utilities ===
+# # fmt: off
+# def create_vision_transform(vla: nn.Module, input_size: int) -> Callable[[Image.Image], torch.Tensor]:
+#     """Gets image transform for the vision encoder."""
+#     data_cfg = timm.data.resolve_model_data_config(vla.vision_backbone)
+#     data_cfg["input_size"] = (3, input_size, input_size)
+#     return timm.data.create_transform(
+#         input_size=data_cfg["input_size"],
+#         interpolation=data_cfg["interpolation"],
+#         mean=data_cfg["mean"],
+#         std=data_cfg["std"],
+#         crop_pct=1.0,           # Set to 1.0 to disable cropping
+#         crop_mode="center",     # Default crop mode --> no-op when `crop_pct == 1.0`
+#         is_training=False,      # Disable image_aug when loading transform; handled by RLDS dataloader
+#     )
+#
+# # fmt: on
+
+
+@dataclass
+class FinetuneConfig:
+    # fmt: off
+    vla_path: str = "openvla/openvla-7b"                            # Path to OpenVLA model (on HuggingFace Hub)
+
+    # Directory Paths
+    data_root_dir: Path = Path("datasets/open-x-embodiment")        # Path to Open-X dataset directory
+    dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
+    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
+    adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+
+    # Fine-tuning Parameters
+    batch_size: int = 16                                            # Fine-tuning batch size
+    max_steps: int = 200_000                                        # Max number of fine-tuning steps
+    save_steps: int = 5000                                          # Interval for checkpoint saving
+    learning_rate: float = 5e-4                                     # Fine-tuning learning rate
+    grad_accumulation_steps: int = 1                                # Gradient accumulation steps
+    image_aug: bool = True                                          # Whether to train with image augmentations
+    shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
+    save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
+                                                                    #   continually overwrite the latest checkpoint
+                                                                    #   (If False, saves all checkpoints)
+
+    # LoRA Arguments
+    use_lora: bool = True                                           # Whether to use LoRA fine-tuning
+    lora_rank: int = 32                                             # Rank of LoRA weight matrix
+    lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
+    use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
+                                                                    #   => CAUTION: Reduces memory but hurts performance
+
+    # Tracking Parameters
+    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
+    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+
+    # fmt: on
+
+
+def main(script_args, training_args, model_args, cfg: FinetuneConfig):
+
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
     print("reward_funcs:", reward_funcs)
 
-    # Load the dataset
-    dataset = LazySupervisedDataset(script_args.dataset_name, script_args)
+    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
-    trainer_cls = Qwen2VLGRPOTrainer
+    # [Validate] Ensure GPU Available & Set Device / Distributed Context
+    assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
+    distributed_state = PartialState() # 初始化 分布式训练的状态 PartialState()
+    torch.cuda.set_device(device_id := distributed_state.local_process_index)
+    torch.cuda.empty_cache()
+
+    # Configure Unique Experiment ID & Log Directory 生成实验 ID 及日志目录
+    exp_id = (
+        f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
+        f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
+        f"+lr-{cfg.learning_rate}"
+    )
+    if cfg.use_lora:
+        exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+    if cfg.use_quantization:
+        exp_id += "+q-4bit"
+    if cfg.run_id_note is not None:
+        exp_id += f"--{cfg.run_id_note}"
+    if cfg.image_aug:
+        exp_id += "--image_aug"
+
+    # Start =>> Build Directories
+    run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Quantization Config =>> only if LoRA fine-tuning 配置量化（暂不使用）
+    quantization_config = None
+    if cfg.use_quantization:
+        assert cfg.use_lora, "Quantized training only supported for LoRA fine-tuning!"
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
+        )
+
+    # 将 OpenVLA 注册为 Hugging Face 的 AutoModel，方便后续调用 from_pretrained() 直接加载。
+    # AutoConfig.register("openvla", OpenVLAConfig)
+    # AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    # AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    # AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+    # 加载 OpenVLA 处理器 & 模型
+    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True) # processor：用于处理 文本 & 图像输入
+    vla = AutoModelForVision2Seq.from_pretrained(
+        cfg.vla_path,
+        torch_dtype=torch.bfloat16,
+        quantization_config=quantization_config,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    ) # vla：加载 OpenVLA 模型，设置 torch_dtype=torch.bfloat16 以减少显存占用
+
+    # 设备分配 & LoRA 微调 Device Placement =>> note that BitsAndBytes automatically handles for quantized training
+    if cfg.use_quantization:
+        vla = prepare_model_for_kbit_training(vla)
+    else:
+        vla = vla.to(device_id)
+
+    # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
+    lora_config = None
+    if cfg.use_lora:
+        lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=min(cfg.lora_rank, 16),
+            lora_dropout=cfg.lora_dropout,
+            target_modules="all-linear",
+            init_lora_weights="gaussian",
+        )
+        # vla = get_peft_model(vla, lora_config)
+        # vla.print_trainable_parameters()
+
+    # 使用 torch.nn.parallel.DistributedDataParallel (DDP) 进行 多 GPU 训练  Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
+    # vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+
+    # Create Optimizer =>> note that we default to a simple constant learning rate!
+    # trainable_params = [param for param in vla.parameters() if param.requires_grad] # 仅优化 需要更新的参数（冻结其他层
+    # optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+
+    # ---------Create Action Tokenizer---------
+    action_tokenizer = ActionTokenizer(processor.tokenizer)
+
+    # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
+    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
+    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
+    #       your own Dataset, make sure to add the appropriate logic to the training loop!
+    #
+    # ---
+    # from prismatic.vla.datasets import DummyDataset
+    #
+    # vla_dataset = DummyDataset(
+    #     action_tokenizer,
+    #     processor.tokenizer,
+    #     image_transform=processor.image_processor.apply_transform,
+    #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+    # )
+    # ---
+    # 加载数据集 使用 RLDS 格式（强化学习数据）
+    batch_transform = RLDSBatchTransform(
+        action_tokenizer,
+        processor.tokenizer,
+        image_transform=processor.image_processor.apply_transform,
+        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+    )
+    vla_dataset = RLDSDataset(
+        cfg.data_root_dir,
+        cfg.dataset_name,
+        batch_transform,
+        resize_resolution=tuple(vla.module.config.image_sizes),
+        shuffle_buffer_size=cfg.shuffle_buffer_size,
+        image_aug=cfg.image_aug, # 使用数据增强
+    )
+
+    # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
+    # 用于保存数据集的统计信息，这些信息在推理（inference）时用于反归一化动作（de-normalize actions）
+    if distributed_state.is_main_process:
+        save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
+
+    # Create Collator and DataLoader 创建数据整理器, 确保训练过程中数据格式的一致性
+    # 由于动作序列的长度不同，我们需要填充（Padding）或截断，以保证所有输入的 input_ids 具有相同长度，方便 批量处理（batch processing）
+    collator = PaddedCollatorForActionPrediction(
+        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
+    )
+    dataloader = DataLoader(
+        vla_dataset,
+        batch_size=cfg.batch_size,
+        sampler=None,
+        collate_fn=collator,
+        num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
+    )
+
+    # Load the dataset
+    # dataset = LazySupervisedDataset(script_args.dataset_name, script_args)
+
+    trainer_cls = OpenVLAGRPOTrainer
     # Initialize the GRPO trainer
-    # ---在此处添加processing_class--并且使用更改过的processing_class，更改dataset类。
-    processing_class = AutoProcessor.from_pretrained("Qwen2.5-VL")
-    pad_token_id = processing_class.tokenizer.pad_token_id
-    processing_class.pad_token_id = pad_token_id
-    processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
-    processing_class.image_processor.max_pixels = script_args.max_pixels
-    processing_class.image_processor.min_pixels = script_args.min_pixels
 
     trainer = trainer_cls(
-        model=model_args.model_name_or_path,
+        model=cfg.vla_path,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=vla_dataset,
         eval_dataset=None,
-        peft_config=get_peft_config(model_args),
+        peft_config=lora_config,
         freeze_vision_modules=model_args.freeze_vision_modules,
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,
         torch_dtype=model_args.torch_dtype,
+        data_collator=collator,
     )
 
     # Train and push the model to the Hub

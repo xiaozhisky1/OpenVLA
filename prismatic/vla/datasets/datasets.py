@@ -44,8 +44,8 @@ class RLDSBatchTransform:
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
         conversation = [
-            {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": self.action_tokenizer(action)},
+            {"from": "human", "value": f"What action should the robot take to {lang}? First output the thinking process in <think> </think> tags and then output the final action in <action> </action> tags. Output the final action in JSON format."},
+            # {"from": "gpt", "value": self.action_tokenizer(action)},
         ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
@@ -60,11 +60,11 @@ class RLDSBatchTransform:
         pixel_values = self.image_transform(img)
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(len(action) + 1)] = IGNORE_INDEX
+        # labels[: -(len(action) + 1)] = IGNORE_INDEX # 确保只对action部分做计算损失
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)
+        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, action = action)
 
 
 class RLDSDataset(IterableDataset):
@@ -92,11 +92,11 @@ class RLDSDataset(IterableDataset):
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,
             mixture_spec,
-            load_camera_views=("primary",),
+            load_camera_views=("primary",), # 只加载主视角 image_primary
             load_depth=False,
             load_proprio=False,
-            load_language=True,
-            action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
+            load_language=True, # load_language=True：加载语言指令
+            action_proprio_normalization_type=NormalizationType.BOUNDS_Q99, # 对动作数据归一化。
         )
         rlds_config = dict(
             traj_transform_kwargs=dict(
